@@ -168,11 +168,20 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
 
-    /* ---- Brake-light-only firmware ---- */
-    bool brake = input_state[CH_BRAKE];       /* PB2 = brake input */
+	/* ---- Inputs (PB1, PB2, PB4 unused) ---- */
+	bool brake     = input_state[2];   /* PB3 = brake light               */
+	bool emergency = input_state[4];   /* PB5 = emergency / hazard (flash) */
 
-    LED_SetRed(brake ? LVL_FULL : LVL_OFF);   /* PB14: brake on -> full, else off */
-    LED_SetAux(LVL_OFF);                       /* PB15 unused in brake-only mode    */
+    /* Brake -> PB14 solid full red */
+    LED_SetRed(brake ? LVL_FULL : LVL_OFF);
+
+    /* Emergency -> PB15 flashing at ~1.5 Hz (toggles every 350 ms) */
+    if (emergency) {
+        bool flash_on = ((HAL_GetTick() / 350u) % 2u) == 0u;
+        LED_SetAux(flash_on ? LVL_FULL : LVL_OFF);
+    } else {
+        LED_SetAux(LVL_OFF);
+    }
 
     HAL_Delay(5);
   }
