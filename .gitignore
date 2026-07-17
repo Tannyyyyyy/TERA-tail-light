@@ -1,0 +1,15 @@
+# Build output
+/Debug/
+/Release/
+*.o
+*.d
+*.su
+*.elf
+*.bin
+*.hex
+*.list
+*.map
+
+# OS / editor
+Thumbs.db
+.DS_Store
