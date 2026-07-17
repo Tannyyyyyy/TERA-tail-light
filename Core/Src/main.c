@@ -23,6 +23,7 @@
 /* USER CODE BEGIN Includes */
 #include <stdint.h>
 #include <stdbool.h>
+#include "ws2812.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -98,29 +99,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     if (htim->Instance == TIM11) PDM_Filter_Tick();
 }
 
-/* implemented in LED_Driver.c */
-extern void LED_Init(void);
-extern void LED_SetRed(uint16_t level);
-extern void LED_SetAux(uint16_t level);
-
-#define LVL_OFF        0
-#define LVL_TAIL_DIM   130
-#define LVL_FULL       1000
-
-#define TURN_RAMP_MS   350
-#define TURN_HOLD_MS   60
-#define TURN_OFF_MS    120
-#define TURN_PERIOD_MS (TURN_RAMP_MS + TURN_HOLD_MS + TURN_OFF_MS)
-
-static uint16_t Turn_SwipeLevel(uint32_t now)
-{
-    uint32_t t = now % TURN_PERIOD_MS;
-    if (t < TURN_RAMP_MS)
-        return (uint16_t)((uint32_t)LVL_FULL * t / TURN_RAMP_MS);
-    if (t < TURN_RAMP_MS + TURN_HOLD_MS)
-        return LVL_FULL;
-    return LVL_OFF;
-}
+/* WS2812B strip driver lives in ws2812.c (data on PB15 via SPI2). */
 
 /* USER CODE END 0 */
 
@@ -156,7 +135,7 @@ int main(void)
   MX_TIM1_Init();
   MX_TIM11_Init();
   /* USER CODE BEGIN 2 */
-  LED_Init();
+  WS2812_Init();
   HAL_TIM_Base_Start_IT(&htim11);
   /* USER CODE END 2 */
 
@@ -172,15 +151,28 @@ int main(void)
 	bool brake     = input_state[2];   /* PB3 = brake light               */
 	bool emergency = input_state[4];   /* PB5 = emergency / hazard (flash) */
 
-    /* Brake -> PB14 solid full red */
-    LED_SetRed(brake ? LVL_FULL : LVL_OFF);
-
-    /* Emergency -> PB15 flashing at ~1.5 Hz (toggles every 350 ms) */
+    /* Decide what the whole 144-LED strip shows.
+       Priority: emergency (flashing amber) overrides brake (solid red). */
+    uint8_t pattern;
     if (emergency) {
         bool flash_on = ((HAL_GetTick() / 350u) % 2u) == 0u;
-        LED_SetAux(flash_on ? LVL_FULL : LVL_OFF);
+        pattern = flash_on ? 2u : 0u;   /* 2 = amber, 0 = off */
+    } else if (brake) {
+        pattern = 1u;                   /* 1 = red */
     } else {
-        LED_SetAux(LVL_OFF);
+        pattern = 0u;                   /* 0 = off */
+    }
+
+    /* Only push a new frame to the strip when the pattern actually changes */
+    static uint8_t last_pattern = 0xFF;
+    if (pattern != last_pattern) {
+        switch (pattern) {
+            case 1:  WS2812_FillRGB(255,   0, 0); break;  /* brake:     red   */
+            case 2:  WS2812_FillRGB(255,  90, 0); break;  /* emergency: amber */
+            default: WS2812_FillRGB(0,     0, 0); break;  /* off              */
+        }
+        WS2812_Show();
+        last_pattern = pattern;
     }
 
     HAL_Delay(5);
