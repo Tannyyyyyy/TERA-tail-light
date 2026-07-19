@@ -60,43 +60,96 @@ static void MX_TIM11_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-#define NUM_INPUTS 5
-static const uint16_t input_pins[NUM_INPUTS] = {
-    GPIO_PIN_1,  /* PB1 = Tail   */
-    GPIO_PIN_2,  /* PB2 = Brake  */
-    GPIO_PIN_3,  /* PB3 = Turn   */
-    GPIO_PIN_4,  /* PB4 = Reverse*/
-    GPIO_PIN_5   /* PB5 = Fog    */
-};
-enum { CH_TAIL = 0, CH_BRAKE, CH_TURN, CH_REVERSE, CH_FOG };
+/* ==========================================================================
+ * Inputs: PB3 = Brake, PB5 = Emergency.  PB1/PB2/PB4 unused (set to analog).
+ *
+ * Both pins are EXTI, rising AND falling edge.  Debouncing is non-blocking
+ * and tick-based:
+ *   - Any edge that leaves the pin HIGH asserts the channel IMMEDIATELY
+ *     (brake lights must react instantly) and refreshes a "last seen high"
+ *     timestamp.
+ *   - The channel de-asserts only after the pin has stayed LOW for
+ *     INPUT_RELEASE_MS with no further edges.
+ * That release delay is what swallows optocoupler contact bounce, and it
+ * also keeps the output steady if the BCM ever drives a chopped/PWM signal
+ * instead of a clean DC level.
+ * ========================================================================== */
+#define IN_BRAKE_PIN      GPIO_PIN_3
+#define IN_EMERGENCY_PIN  GPIO_PIN_5
 
-#define FILTER_MAX  1000
-#define FILTER_UP   8
-#define FILTER_DOWN 1
-#define THRESH_HIGH 800
-#define THRESH_LOW  150
+#define NUM_INPUTS        2
+enum { CH_BRAKE = 0, CH_EMERGENCY };
 
-static volatile uint16_t filt_acc[NUM_INPUTS]    = {0};
-static volatile uint8_t  input_state[NUM_INPUTS] = {0};
+#define INPUT_RELEASE_MS  60u   /* low-quiet time required before turning off */
 
-static void PDM_Filter_Tick(void)
+static const uint16_t input_pins[NUM_INPUTS] = { IN_BRAKE_PIN, IN_EMERGENCY_PIN };
+
+static volatile uint8_t  input_state[NUM_INPUTS]   = {0};  /* debounced result */
+static volatile uint32_t last_high_tick[NUM_INPUTS] = {0};
+
+/* Called from the EXTI ISRs (via HAL) on every rising and falling edge. */
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
     for (int i = 0; i < NUM_INPUTS; i++) {
-        uint8_t raw = (HAL_GPIO_ReadPin(GPIOB, input_pins[i]) == GPIO_PIN_SET);
-        if (raw) {
-            filt_acc[i] += FILTER_UP;
-            if (filt_acc[i] > FILTER_MAX) filt_acc[i] = FILTER_MAX;
-        } else {
-            if (filt_acc[i] < FILTER_DOWN) filt_acc[i] = 0;
-            else                           filt_acc[i] -= FILTER_DOWN;
+        if (GPIO_Pin != input_pins[i]) continue;
+
+        if (HAL_GPIO_ReadPin(GPIOB, input_pins[i]) == GPIO_PIN_SET) {
+            input_state[i]    = 1;              /* assert immediately */
+            last_high_tick[i] = HAL_GetTick();
         }
-        if (filt_acc[i] >= THRESH_HIGH)     input_state[i] = 1;
-        else if (filt_acc[i] <= THRESH_LOW) input_state[i] = 0;
+        /* Falling edges do NOT clear here - Inputs_Service() handles release
+           once the line has been quiet long enough. */
     }
 }
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+
+/* Non-blocking release timer, called from the main loop. */
+static void Inputs_Service(void)
 {
-    if (htim->Instance == TIM11) PDM_Filter_Tick();
+    uint32_t now = HAL_GetTick();
+    for (int i = 0; i < NUM_INPUTS; i++) {
+        if (!input_state[i]) continue;
+        if ((now - last_high_tick[i]) < INPUT_RELEASE_MS) continue;
+
+        if (HAL_GPIO_ReadPin(GPIOB, input_pins[i]) == GPIO_PIN_RESET) {
+            input_state[i] = 0;
+        } else {
+            last_high_tick[i] = now;            /* still high, keep it asserted */
+        }
+    }
+}
+
+/* Configure PB3/PB5 as EXTI inputs and park the unused pins in analog mode.
+   Done here (not in CubeMX) so regenerating code can't undo it. */
+static void Inputs_Init(void)
+{
+    GPIO_InitTypeDef g = {0};
+
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+
+    /* PB1, PB2, PB4 unused -> analog, lowest leakage */
+    g.Pin  = GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_4;
+    g.Mode = GPIO_MODE_ANALOG;
+    g.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOB, &g);
+
+    /* PB3, PB5 -> interrupt on both edges. External 10k pulls them down. */
+    g.Pin  = IN_BRAKE_PIN | IN_EMERGENCY_PIN;
+    g.Mode = GPIO_MODE_IT_RISING_FALLING;
+    g.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOB, &g);
+
+    HAL_NVIC_SetPriority(EXTI3_IRQn, 5, 0);     /* PB3 */
+    HAL_NVIC_EnableIRQ(EXTI3_IRQn);
+    HAL_NVIC_SetPriority(EXTI9_5_IRQn, 5, 0);   /* PB5 */
+    HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
+
+    /* Seed the state in case a signal is already present at power-up */
+    for (int i = 0; i < NUM_INPUTS; i++) {
+        if (HAL_GPIO_ReadPin(GPIOB, input_pins[i]) == GPIO_PIN_SET) {
+            input_state[i]    = 1;
+            last_high_tick[i] = HAL_GetTick();
+        }
+    }
 }
 
 /* WS2812B strip driver lives in ws2812.c (data on PB15 via SPI2). */
@@ -135,8 +188,8 @@ int main(void)
   MX_TIM1_Init();
   MX_TIM11_Init();
   /* USER CODE BEGIN 2 */
-  WS2812_Init();
-  HAL_TIM_Base_Start_IT(&htim11);
+  WS2812_Init();     /* SPI2 on PB15 + blank the strip */
+  Inputs_Init();     /* PB3/PB5 EXTI, PB1/PB2/PB4 analog */
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -147,9 +200,12 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
 
-	/* ---- Inputs (PB1, PB2, PB4 unused) ---- */
-	bool brake     = input_state[2];   /* PB3 = brake light               */
-	bool emergency = input_state[4];   /* PB5 = emergency / hazard (flash) */
+    /* Run the non-blocking release timer for the debounced inputs */
+    Inputs_Service();
+
+    /* ---- Inputs (PB1, PB2, PB4 unused) ---- */
+    bool brake     = input_state[CH_BRAKE];      /* PB3 = brake light      */
+    bool emergency = input_state[CH_EMERGENCY];  /* PB5 = emergency/hazard */
 
     /* Decide what the whole 144-LED strip shows.
        Priority: emergency (flashing amber) overrides brake (solid red). */
@@ -353,6 +409,19 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+
+/* EXTI vectors. These live here (not stm32f4xx_it.c) because the EXTI lines
+   are configured in code rather than in CubeMX, so CubeMX never generates
+   them. HAL_GPIO_EXTI_IRQHandler clears the flag and calls our callback. */
+void EXTI3_IRQHandler(void)     /* PB3 = brake */
+{
+    HAL_GPIO_EXTI_IRQHandler(IN_BRAKE_PIN);
+}
+
+void EXTI9_5_IRQHandler(void)   /* PB5 = emergency (line 5 of the 5..9 group) */
+{
+    HAL_GPIO_EXTI_IRQHandler(IN_EMERGENCY_PIN);
+}
 
 /* USER CODE END 4 */
 
