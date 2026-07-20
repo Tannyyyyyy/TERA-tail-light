@@ -152,7 +152,69 @@ static void Inputs_Init(void)
     }
 }
 
-/* WS2812B strip driver lives in ws2812.c (data on PB15 via SPI2). */
+/* ==========================================================================
+ * Light sequences.  Strip driver itself lives in ws2812.c (PB15 via SPI2).
+ *
+ *   Startup   - red sweeps from the middle out to both ends, then the whole
+ *               strip settles down to the 60% running level.
+ *   Running   - solid red at 60%  (idle state, after startup)
+ *   Brake     - solid red at 100%
+ *   Emergency - the outer EDGE_COUNT LEDs at each end flash amber on top of
+ *               whatever the rest of the strip is showing.
+ * ========================================================================== */
+#define LED_COUNT        WS_NUM_LEDS   /* 144 */
+#define EDGE_COUNT       14            /* emergency LEDs at each end        */
+
+#define LEVEL_FULL       255u          /* brake      = 100%                 */
+#define LEVEL_RUN        153u          /* running    =  60% of full         */
+
+#define EMERG_HALF_MS    350u          /* amber on/off half-period (~1.4 Hz) */
+
+#define AMBER_R          255u
+#define AMBER_G           90u
+
+/* Boot animation: centre -> outwards, then dim to the running level. */
+static void Startup_Sequence(void)
+{
+    const uint16_t right0 = LED_COUNT / 2;      /* 72 */
+    const uint16_t left0  = right0 - 1u;        /* 71 */
+
+    WS2812_Clear();
+    WS2812_Show();
+
+    for (uint16_t s = 0; s < right0; s++) {
+        WS2812_SetPixel((uint16_t)(right0 + s), LEVEL_FULL, 0, 0);
+        WS2812_SetPixel((uint16_t)(left0  - s), LEVEL_FULL, 0, 0);
+        WS2812_Show();
+        HAL_Delay(4);
+    }
+
+    for (uint16_t lvl = LEVEL_FULL; lvl > LEVEL_RUN; lvl -= 3u) {
+        WS2812_FillRGB((uint8_t)lvl, 0, 0);
+        WS2812_Show();
+        HAL_Delay(10);
+    }
+
+    WS2812_FillRGB(LEVEL_RUN, 0, 0);
+    WS2812_Show();
+}
+
+/* Paint one frame from the current input state. */
+static void Render(bool brake, bool emergency_lit)
+{
+    uint8_t base = brake ? (uint8_t)LEVEL_FULL : (uint8_t)LEVEL_RUN;
+
+    WS2812_FillRGB(base, 0, 0);
+
+    if (emergency_lit) {
+        for (uint16_t i = 0; i < EDGE_COUNT; i++) {
+            WS2812_SetPixel(i, AMBER_R, AMBER_G, 0);
+            WS2812_SetPixel((uint16_t)(LED_COUNT - 1u - i), AMBER_R, AMBER_G, 0);
+        }
+    }
+
+    WS2812_Show();
+}
 
 /* USER CODE END 0 */
 
@@ -188,8 +250,9 @@ int main(void)
   MX_TIM1_Init();
   MX_TIM11_Init();
   /* USER CODE BEGIN 2 */
-  WS2812_Init();     /* SPI2 on PB15 + blank the strip */
-  Inputs_Init();     /* PB3/PB5 EXTI, PB1/PB2/PB4 analog */
+  WS2812_Init();       /* SPI2 on PB15 + blank the strip     */
+  Inputs_Init();       /* PB3/PB5 EXTI, PB1/PB2/PB4 analog   */
+  Startup_Sequence();  /* centre-out sweep, settle to 60%    */
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -207,28 +270,17 @@ int main(void)
     bool brake     = input_state[CH_BRAKE];      /* PB3 = brake light      */
     bool emergency = input_state[CH_EMERGENCY];  /* PB5 = emergency/hazard */
 
-    /* Decide what the whole 144-LED strip shows.
-       Priority: emergency (flashing amber) overrides brake (solid red). */
-    uint8_t pattern;
-    if (emergency) {
-        bool flash_on = ((HAL_GetTick() / 350u) % 2u) == 0u;
-        pattern = flash_on ? 2u : 0u;   /* 2 = amber, 0 = off */
-    } else if (brake) {
-        pattern = 1u;                   /* 1 = red */
-    } else {
-        pattern = 0u;                   /* 0 = off */
-    }
+    /* Emergency blinks the outer LEDs; it layers on top of the red base
+       rather than replacing it, so the brake stays visible while flashing. */
+    bool emergency_lit = emergency &&
+                         (((HAL_GetTick() / EMERG_HALF_MS) % 2u) == 0u);
 
-    /* Only push a new frame to the strip when the pattern actually changes */
-    static uint8_t last_pattern = 0xFF;
-    if (pattern != last_pattern) {
-        switch (pattern) {
-            case 1:  WS2812_FillRGB(255,   0, 0); break;  /* brake:     red   */
-            case 2:  WS2812_FillRGB(255,  90, 0); break;  /* emergency: amber */
-            default: WS2812_FillRGB(0,     0, 0); break;  /* off              */
-        }
-        WS2812_Show();
-        last_pattern = pattern;
+    /* Only push a new frame when the picture actually changes */
+    uint8_t frame = (uint8_t)((brake ? 1u : 0u) | (emergency_lit ? 2u : 0u));
+    static uint8_t last_frame = 0xFF;
+    if (frame != last_frame) {
+        Render(brake, emergency_lit);
+        last_frame = frame;
     }
 
     HAL_Delay(5);
