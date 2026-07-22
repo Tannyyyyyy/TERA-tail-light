@@ -76,16 +76,13 @@ static void MX_TIM11_Init(void);
  * ========================================================================== */
 #define IN_BRAKE_PIN      GPIO_PIN_3
 #define IN_EMERGENCY_PIN  GPIO_PIN_5
-#define IN_IGNITION_PIN   GPIO_PIN_4   /* 12V "car on / start" signal (via divider) */
 
-#define NUM_INPUTS        3
-enum { CH_BRAKE = 0, CH_EMERGENCY, CH_IGNITION };
+#define NUM_INPUTS        2
+enum { CH_BRAKE = 0, CH_EMERGENCY };
 
 #define INPUT_RELEASE_MS  60u   /* low-quiet time required before turning off */
 
-static const uint16_t input_pins[NUM_INPUTS] = { IN_BRAKE_PIN,
-                                                 IN_EMERGENCY_PIN,
-                                                 IN_IGNITION_PIN };
+static const uint16_t input_pins[NUM_INPUTS] = { IN_BRAKE_PIN, IN_EMERGENCY_PIN };
 
 static volatile uint8_t  input_state[NUM_INPUTS]   = {0};  /* debounced result */
 static volatile uint32_t last_high_tick[NUM_INPUTS] = {0};
@@ -129,22 +126,20 @@ static void Inputs_Init(void)
 
     __HAL_RCC_GPIOB_CLK_ENABLE();
 
-    /* PB1, PB2 unused -> analog, lowest leakage */
-    g.Pin  = GPIO_PIN_1 | GPIO_PIN_2;
+    /* PB1, PB2, PB4 unused -> analog, lowest leakage */
+    g.Pin  = GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_4;
     g.Mode = GPIO_MODE_ANALOG;
     g.Pull = GPIO_NOPULL;
     HAL_GPIO_Init(GPIOB, &g);
 
-    /* PB3, PB4, PB5 -> interrupt on both edges. External 10k pulls them down. */
-    g.Pin  = IN_BRAKE_PIN | IN_EMERGENCY_PIN | IN_IGNITION_PIN;
+    /* PB3, PB5 -> interrupt on both edges. External 10k pulls them down. */
+    g.Pin  = IN_BRAKE_PIN | IN_EMERGENCY_PIN;
     g.Mode = GPIO_MODE_IT_RISING_FALLING;
     g.Pull = GPIO_NOPULL;
     HAL_GPIO_Init(GPIOB, &g);
 
     HAL_NVIC_SetPriority(EXTI3_IRQn, 5, 0);     /* PB3 */
     HAL_NVIC_EnableIRQ(EXTI3_IRQn);
-    HAL_NVIC_SetPriority(EXTI4_IRQn, 5, 0);     /* PB4 */
-    HAL_NVIC_EnableIRQ(EXTI4_IRQn);
     HAL_NVIC_SetPriority(EXTI9_5_IRQn, 5, 0);   /* PB5 */
     HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
 
@@ -309,11 +304,16 @@ int main(void)
   MX_TIM1_Init();
   MX_TIM11_Init();
   /* USER CODE BEGIN 2 */
-  WS2812_Init();       /* TIM1_CH2N on PB14 + blank the strip        */
-  Inputs_Init();       /* PB3 brake, PB4 ignition, PB5 emergency EXTI */
-  /* No animation here: the startup sweep is triggered by the 12V
-     ignition signal (PB4) in the loop below, so it replays every time
-     the car is switched on - not just once at power-up. */
+  WS2812_Init();       /* TIM1_CH2N on PB14 + blank the strip */
+  Inputs_Init();       /* PB3 brake, PB5 emergency EXTI       */
+
+  /* The whole board is powered by the car's 12V, so power-up IS the "start"
+     event - the animation runs here, once, every time the car switches on.
+     Wait first: at cold power-up the LED strip's own 5V rail needs a moment
+     to come alive, and if we start clocking data out before then the strip
+     misses the sweep and you only ever see the steady running level. */
+  HAL_Delay(300);
+  Startup_Sequence();  /* red sweep middle -> ends, settle to running level */
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -327,39 +327,22 @@ int main(void)
     /* Run the non-blocking release timer for the debounced inputs */
     Inputs_Service();
 
-    /* ---- Inputs (PB1, PB2 unused) ---- */
+    /* ---- Inputs (PB1, PB2, PB4 unused) ---- */
     bool brake     = input_state[CH_BRAKE];      /* PB3 = brake light      */
     bool emergency = input_state[CH_EMERGENCY];  /* PB5 = emergency/hazard */
-    bool ignition  = input_state[CH_IGNITION];   /* PB4 = 12V car-on       */
 
-    static bool    prev_ignition = false;
-    static uint8_t last_frame    = 0xFF;
+    /* Emergency blinks the outer LEDs; the middle of the strip keeps showing
+       the running/brake level underneath. */
+    bool emergency_lit = ((HAL_GetTick() / EMERG_HALF_MS) % 2u) == 0u;
 
-    if (ignition && !prev_ignition) {
-        /* Car just switched on: play the startup sweep, then settle to 20%. */
-        Startup_Sequence();
-        last_frame = 0xFF;              /* force a fresh render afterwards   */
-    } else if (!ignition && prev_ignition) {
-        /* Car switched off: blank the strip completely. */
-        WS2812_Clear();
-        WS2812_Show();
-        last_frame = 0xFF;
-    }
-    prev_ignition = ignition;
-
-    if (ignition) {
-        /* Emergency blinks the outer LEDs; the middle of the strip keeps
-           showing the running/brake level underneath. */
-        bool emergency_lit = ((HAL_GetTick() / EMERG_HALF_MS) % 2u) == 0u;
-
-        /* Only push a new frame when the picture actually changes */
-        uint8_t frame = (uint8_t)((brake                    ? 1u : 0u)
-                                | (emergency                ? 2u : 0u)
-                                | ((emergency && emergency_lit) ? 4u : 0u));
-        if (frame != last_frame) {
-            Render(brake, emergency, emergency_lit);
-            last_frame = frame;
-        }
+    /* Only push a new frame when the picture actually changes */
+    uint8_t frame = (uint8_t)((brake                    ? 1u : 0u)
+                            | (emergency                ? 2u : 0u)
+                            | ((emergency && emergency_lit) ? 4u : 0u));
+    static uint8_t last_frame = 0xFF;
+    if (frame != last_frame) {
+        Render(brake, emergency, emergency_lit);
+        last_frame = frame;
     }
 
     HAL_Delay(5);
@@ -547,11 +530,6 @@ static void MX_GPIO_Init(void)
 void EXTI3_IRQHandler(void)     /* PB3 = brake */
 {
     HAL_GPIO_EXTI_IRQHandler(IN_BRAKE_PIN);
-}
-
-void EXTI4_IRQHandler(void)     /* PB4 = ignition / 12V car-on */
-{
-    HAL_GPIO_EXTI_IRQHandler(IN_IGNITION_PIN);
 }
 
 void EXTI9_5_IRQHandler(void)   /* PB5 = emergency (line 5 of the 5..9 group) */
