@@ -155,9 +155,9 @@ static void Inputs_Init(void)
 /* ==========================================================================
  * Light sequences.  Strip driver itself lives in ws2812.c (PB15 via SPI2).
  *
- *   Startup   - red sweeps from the middle out to both ends, then the whole
- *               strip settles down to the 40% running level.
- *   Running   - solid red at 40%  (idle state, after startup)
+ *   Startup   - red sweeps slowly from the middle out to both ends, then the
+ *               whole strip settles down to the dim running level.
+ *   Running   - solid red at ~8%  (idle state, after startup)
  *   Brake     - solid red at 100%
  *   Emergency - the outer EDGE_COUNT LEDs at each end blink full-red <-> off
  *               on top of whatever the rest of the strip is showing.
@@ -166,10 +166,10 @@ static void Inputs_Init(void)
 #define EDGE_COUNT       14            /* emergency LEDs at each end        */
 
 #define LEVEL_FULL       255u          /* brake      = 100%                 */
-#define LEVEL_RUN        51u           /* running    =  20% of full         */
+#define LEVEL_RUN        20u           /* running    =  ~8% of full (dim)   */
 
 #define EMERG_HALF_MS    350u          /* flash on/off half-period (~1.4 Hz) */
-#define SWEEP_STEP_MS    14u           /* startup sweep pace (bigger = slower) */
+#define SWEEP_STEP_MS    40u           /* startup sweep pace (bigger = slower) */
 
 /* --------------------------------------------------------------------------
  * TEMPORARY DIAGNOSTIC.  Set to 0 to get the normal boot animation back.
