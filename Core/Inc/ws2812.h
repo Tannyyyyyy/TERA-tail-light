@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 /* Number of LEDs on the strip */
-#define WS_NUM_LEDS 144
+#define WS_NUM_LEDS 197
 
 void WS2812_Init(void);
 void WS2812_SetBrightness(uint8_t b);                 /* 0..255 global cap  */
