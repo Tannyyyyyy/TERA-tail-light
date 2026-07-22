@@ -169,7 +169,7 @@ static void Inputs_Init(void)
 #define LEVEL_RUN        20u           /* running    =  ~8% of full (dim)   */
 
 #define EMERG_HALF_MS    350u          /* flash on/off half-period (~1.4 Hz) */
-#define SWEEP_STEP_MS    40u           /* startup sweep pace (bigger = slower) */
+#define SWEEP_STEP_MS    61u           /* startup sweep pace: 99 steps * 61ms ~= 6 s */
 
 /* --------------------------------------------------------------------------
  * TEMPORARY DIAGNOSTIC.  Set to 0 to get the normal boot animation back.
