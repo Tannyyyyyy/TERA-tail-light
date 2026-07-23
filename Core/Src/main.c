@@ -89,6 +89,22 @@ enum { CH_BRAKE = 0, CH_EMERGENCY };
 static const uint16_t input_pins[NUM_INPUTS]       = { IN_BRAKE_PIN, IN_EMERGENCY_PIN };
 static const uint32_t input_release_ms[NUM_INPUTS] = { BRAKE_RELEASE_MS, EMERGENCY_RELEASE_MS };
 
+/* Which electrical level on the pin means "pressed":
+ *   Brake     - the wiring pulls PB3 HIGH while the pedal is down  -> active HIGH.
+ *   Emergency - the switch pulls PB1 LOW when it is turned ON; with the switch
+ *               off the pin sits HIGH. Reading it as active-high made the
+ *               emergency lights run backwards (lit when off, dark when on),
+ *               so this channel is active LOW.
+ * Each pin also gets the pull that parks it in the RELEASED state when nothing
+ * is connected: pull-down for active-high, pull-up for active-low. */
+static const GPIO_PinState input_active[NUM_INPUTS] = { GPIO_PIN_SET, GPIO_PIN_RESET };
+
+/* Raw (undebounced) "is this channel pressed right now?", polarity-aware. */
+static inline bool Input_Pressed(int i)
+{
+    return HAL_GPIO_ReadPin(GPIOB, input_pins[i]) == input_active[i];
+}
+
 static volatile uint8_t  input_state[NUM_INPUTS]   = {0};  /* debounced result */
 static volatile uint32_t last_high_tick[NUM_INPUTS] = {0};
 
@@ -98,7 +114,7 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
     for (int i = 0; i < NUM_INPUTS; i++) {
         if (GPIO_Pin != input_pins[i]) continue;
 
-        if (HAL_GPIO_ReadPin(GPIOB, input_pins[i]) == GPIO_PIN_SET) {
+        if (Input_Pressed(i)) {
             input_state[i]    = 1;              /* assert immediately */
             last_high_tick[i] = HAL_GetTick();
         }
@@ -115,10 +131,10 @@ static void Inputs_Service(void)
         if (!input_state[i]) continue;
         if ((now - last_high_tick[i]) < input_release_ms[i]) continue;
 
-        if (HAL_GPIO_ReadPin(GPIOB, input_pins[i]) == GPIO_PIN_RESET) {
+        if (!Input_Pressed(i)) {
             input_state[i] = 0;
         } else {
-            last_high_tick[i] = now;            /* still high, keep it asserted */
+            last_high_tick[i] = now;            /* still pressed, keep asserted */
         }
     }
 }
@@ -137,13 +153,19 @@ static void Inputs_Init(void)
     g.Pull = GPIO_NOPULL;
     HAL_GPIO_Init(GPIOB, &g);
 
-    /* PB3 (brake), PB1 (emergency) -> interrupt on both edges. Button sends
-       3.3V HIGH when pressed. Internal pull-down holds the line LOW when the
-       button is released / the input is left unconnected, so a floating pin
-       can't be read as a false press. */
-    g.Pin  = IN_BRAKE_PIN | IN_EMERGENCY_PIN;
+    /* Both inputs interrupt on rising AND falling edges; only the resting pull
+       differs, so that an unconnected pin always reads as "released".
+
+       PB3 (brake) is active HIGH -> pull-down parks it low/released. */
+    g.Pin  = IN_BRAKE_PIN;
     g.Mode = GPIO_MODE_IT_RISING_FALLING;
     g.Pull = GPIO_PULLDOWN;
+    HAL_GPIO_Init(GPIOB, &g);
+
+    /* PB1 (emergency) is active LOW -> pull-up parks it high/released. */
+    g.Pin  = IN_EMERGENCY_PIN;
+    g.Mode = GPIO_MODE_IT_RISING_FALLING;
+    g.Pull = GPIO_PULLUP;
     HAL_GPIO_Init(GPIOB, &g);
 
     HAL_NVIC_SetPriority(EXTI3_IRQn, 5, 0);     /* PB3 brake     */
@@ -153,7 +175,7 @@ static void Inputs_Init(void)
 
     /* Seed the state in case a signal is already present at power-up */
     for (int i = 0; i < NUM_INPUTS; i++) {
-        if (HAL_GPIO_ReadPin(GPIOB, input_pins[i]) == GPIO_PIN_SET) {
+        if (Input_Pressed(i)) {
             input_state[i]    = 1;
             last_high_tick[i] = HAL_GetTick();
         }
@@ -180,12 +202,12 @@ static void Inputs_Init(void)
 #define EMERG_G          100u
 
 #define LEVEL_FULL       255u          /* brake      = 100%                 */
-/* Running/idle level. NOTE: the driver caps everything at s_bright = 96, so
- * the value each LED actually gets is LEVEL_RUN * 96 / 255. Lower = dimmer
- * idle. The practical floor is an *effective* value of ~4 (LEVEL_RUN ~= 11);
- * below that WS2812 red goes steppy/flickery. Old value 20 (eff. 7) read as
- * too bright; 11 (eff. 4) is about as dim as it goes cleanly. */
-#define LEVEL_RUN        11u
+/* Running/idle level = ~8% of the brake brightness. NOTE: the driver caps
+ * everything at s_bright = 96, so what an LED actually gets is
+ * LEVEL_RUN * 96 / 255:  20 -> 7, against the brake's 96, i.e. ~8%.
+ * Lower = dimmer, but below an effective ~4 (LEVEL_RUN ~= 11) WS2812 red goes
+ * steppy and reads as "off", which is what 11 was doing. */
+#define LEVEL_RUN        20u
 
 /* Emergency is a steady button, so the firmware blinks the end-sections on its
    own timer (EMERG_HALF_MS = half of one on/off blink period). */
@@ -272,20 +294,25 @@ static void Startup_Sequence(void)
 }
 
 /* Paint one frame from the current input state:
- *   Idle      - whole strip OFF.
- *   Brake     - whole strip full red.
+ *   Idle      - whole strip at the dim running level (~8%).
+ *   Brake     - whole strip SOLID full red (no blinking).
  *   Emergency - the 14 LEDs at EACH end blink full-red <-> off; the centre
  *               just shows the base (dark when idle, full red when braking).
  * The strip sits behind a red lens, so only red/brightness is meaningful.
  * 'emergency_lit' is the current phase of the firmware blink timer. */
 static void Render(bool brake, bool emergency, bool emergency_lit)
 {
-    uint8_t base = brake ? (uint8_t)LEVEL_FULL : 0u;   /* idle = OFF */
+    /* Base layer never blinks: it is either the dim idle glow or solid full
+       red. Only the end sections below are allowed to flash. */
+    uint8_t base = brake ? (uint8_t)LEVEL_FULL : (uint8_t)LEVEL_RUN;
 
     WS2812_FillRGB(base, 0, 0);
 
     if (emergency) {
-        uint8_t er = emergency_lit ? (uint8_t)EMERG_R : 0u;   /* amber when lit */
+        /* Lit phase = amber; dark phase falls back to the base layer so the
+           ends dip to the idle glow (or the brake red) instead of punching
+           black gaps in the strip. */
+        uint8_t er = emergency_lit ? (uint8_t)EMERG_R : base;
         uint8_t eg = emergency_lit ? (uint8_t)EMERG_G : 0u;
         for (uint16_t i = 0; i < EDGE_COUNT_L; i++)           /* left end  (0 ..)         */
             WS2812_SetPixel(i, er, eg, 0);
