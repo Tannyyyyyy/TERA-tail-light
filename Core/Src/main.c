@@ -61,28 +61,33 @@ static void MX_TIM11_Init(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 /* ==========================================================================
- * Inputs: PB3 = Brake, PB5 = Emergency.  PB1/PB2/PB4 unused (set to analog).
+ * Inputs: PB3 = Brake, PB1 = Emergency.  PB2/PB4/PB5 unused (set to analog).
  *
  * Both pins are EXTI, rising AND falling edge.  Debouncing is non-blocking
  * and tick-based:
  *   - Any edge that leaves the pin HIGH asserts the channel IMMEDIATELY
  *     (brake lights must react instantly) and refreshes a "last seen high"
  *     timestamp.
- *   - The channel de-asserts only after the pin has stayed LOW for
- *     INPUT_RELEASE_MS with no further edges.
- * That release delay is what swallows optocoupler contact bounce, and it
- * also keeps the output steady if the BCM ever drives a chopped/PWM signal
- * instead of a clean DC level.
+ *   - The channel de-asserts only after the pin has stayed LOW for its
+ *     per-channel release time (see BRAKE_RELEASE_MS / EMERGENCY_RELEASE_MS)
+ *     with no further edges.
+ * That release delay swallows button contact bounce. Both inputs are steady
+ * 3.3V buttons - HIGH while pressed - so a short release is all that's needed.
  * ========================================================================== */
 #define IN_BRAKE_PIN      GPIO_PIN_3
-#define IN_EMERGENCY_PIN  GPIO_PIN_5
+#define IN_EMERGENCY_PIN  GPIO_PIN_1
 
 #define NUM_INPUTS        2
 enum { CH_BRAKE = 0, CH_EMERGENCY };
 
-#define INPUT_RELEASE_MS  60u   /* low-quiet time required before turning off */
+/* Per-channel low-quiet time before a channel de-asserts (debounce). Both
+ * inputs are steady 3.3V buttons (HIGH while pressed), so a short release is
+ * enough just to swallow contact bounce; both drop out quickly on release. */
+#define BRAKE_RELEASE_MS      60u
+#define EMERGENCY_RELEASE_MS  60u
 
-static const uint16_t input_pins[NUM_INPUTS] = { IN_BRAKE_PIN, IN_EMERGENCY_PIN };
+static const uint16_t input_pins[NUM_INPUTS]       = { IN_BRAKE_PIN, IN_EMERGENCY_PIN };
+static const uint32_t input_release_ms[NUM_INPUTS] = { BRAKE_RELEASE_MS, EMERGENCY_RELEASE_MS };
 
 static volatile uint8_t  input_state[NUM_INPUTS]   = {0};  /* debounced result */
 static volatile uint32_t last_high_tick[NUM_INPUTS] = {0};
@@ -108,7 +113,7 @@ static void Inputs_Service(void)
     uint32_t now = HAL_GetTick();
     for (int i = 0; i < NUM_INPUTS; i++) {
         if (!input_state[i]) continue;
-        if ((now - last_high_tick[i]) < INPUT_RELEASE_MS) continue;
+        if ((now - last_high_tick[i]) < input_release_ms[i]) continue;
 
         if (HAL_GPIO_ReadPin(GPIOB, input_pins[i]) == GPIO_PIN_RESET) {
             input_state[i] = 0;
@@ -126,22 +131,25 @@ static void Inputs_Init(void)
 
     __HAL_RCC_GPIOB_CLK_ENABLE();
 
-    /* PB1, PB2, PB4 unused -> analog, lowest leakage */
-    g.Pin  = GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_4;
+    /* PB2, PB4, PB5 unused -> analog, lowest leakage */
+    g.Pin  = GPIO_PIN_2 | GPIO_PIN_4 | GPIO_PIN_5;
     g.Mode = GPIO_MODE_ANALOG;
     g.Pull = GPIO_NOPULL;
     HAL_GPIO_Init(GPIOB, &g);
 
-    /* PB3, PB5 -> interrupt on both edges. External 10k pulls them down. */
+    /* PB3 (brake), PB1 (emergency) -> interrupt on both edges. Button sends
+       3.3V HIGH when pressed. Internal pull-down holds the line LOW when the
+       button is released / the input is left unconnected, so a floating pin
+       can't be read as a false press. */
     g.Pin  = IN_BRAKE_PIN | IN_EMERGENCY_PIN;
     g.Mode = GPIO_MODE_IT_RISING_FALLING;
-    g.Pull = GPIO_NOPULL;
+    g.Pull = GPIO_PULLDOWN;
     HAL_GPIO_Init(GPIOB, &g);
 
-    HAL_NVIC_SetPriority(EXTI3_IRQn, 5, 0);     /* PB3 */
+    HAL_NVIC_SetPriority(EXTI3_IRQn, 5, 0);     /* PB3 brake     */
     HAL_NVIC_EnableIRQ(EXTI3_IRQn);
-    HAL_NVIC_SetPriority(EXTI9_5_IRQn, 5, 0);   /* PB5 */
-    HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
+    HAL_NVIC_SetPriority(EXTI1_IRQn, 5, 0);     /* PB1 emergency */
+    HAL_NVIC_EnableIRQ(EXTI1_IRQn);
 
     /* Seed the state in case a signal is already present at power-up */
     for (int i = 0; i < NUM_INPUTS; i++) {
@@ -163,13 +171,26 @@ static void Inputs_Init(void)
  *               on top of whatever the rest of the strip is showing.
  * ========================================================================== */
 #define LED_COUNT        WS_NUM_LEDS   /* 144 */
-#define EDGE_COUNT       14            /* emergency LEDs at each end        */
+#define EDGE_COUNT_L     40            /* emergency LEDs at the index-0 end (left)  */
+#define EDGE_COUNT_R     50            /* emergency LEDs at the far end (right)     */
+
+/* Emergency "ember"/amber colour for the end sections. Raise EMERG_G toward
+   ~190 for a yellower amber, lower it toward 0 for a redder/orange amber. */
+#define EMERG_R          255u
+#define EMERG_G          100u
 
 #define LEVEL_FULL       255u          /* brake      = 100%                 */
-#define LEVEL_RUN        20u           /* running    =  ~8% of full (dim)   */
+/* Running/idle level. NOTE: the driver caps everything at s_bright = 96, so
+ * the value each LED actually gets is LEVEL_RUN * 96 / 255. Lower = dimmer
+ * idle. The practical floor is an *effective* value of ~4 (LEVEL_RUN ~= 11);
+ * below that WS2812 red goes steppy/flickery. Old value 20 (eff. 7) read as
+ * too bright; 11 (eff. 4) is about as dim as it goes cleanly. */
+#define LEVEL_RUN        11u
 
+/* Emergency is a steady button, so the firmware blinks the end-sections on its
+   own timer (EMERG_HALF_MS = half of one on/off blink period). */
 #define EMERG_HALF_MS    350u          /* flash on/off half-period (~1.4 Hz) */
-#define SWEEP_STEP_MS    61u           /* startup sweep pace: 99 steps * 61ms ~= 6 s */
+#define SWEEP_STEP_MS    0u            /* sweep pace; 0 = as fast as the strip refreshes (~0.6 s total) */
 
 /* --------------------------------------------------------------------------
  * TEMPORARY DIAGNOSTIC.  Set to 0 to get the normal boot animation back.
@@ -182,11 +203,23 @@ static void Inputs_Init(void)
  *   4. last pixel only            -> should be the far end
  *   5. every 10th pixel for 5 s   -> count the dots x10 = real strip length
  * ------------------------------------------------------------------------ */
-#define STARTUP_DIAG 0
+#define STARTUP_DIAG 0   /* 1 = run the boot diagnostic instead of the sweep */
 
 #if STARTUP_DIAG
 static void Startup_Diag(void)
 {
+    /* 0 - TIMING PROBE: whole strip full red, held 2 s, then off 1 s.
+     *   - If you see a steady ~2 s red hold, HAL_Delay() works -> the missing
+     *     sweep is a DISPLAY/signalling issue, not timing.
+     *   - If it just flashes past instantly, HAL_Delay() is NOT delaying ->
+     *     the whole animation is collapsing and it's a clock/timing problem. */
+    WS2812_FillRGB(LEVEL_FULL, 0, 0);
+    WS2812_Show();
+    HAL_Delay(2000);
+    WS2812_Clear();
+    WS2812_Show();
+    HAL_Delay(1000);
+
     WS2812_Clear();
     WS2812_Show();
     HAL_Delay(1500);                                    /* 1 - all off      */
@@ -215,12 +248,10 @@ static void Startup_Diag(void)
 }
 #endif
 
-/* Boot animation: centre -> outwards, then dim to the running level. */
+/* Start sweep: red fills from the centre outwards to both ends, holds a
+   moment, then goes dark - ready for the main loop / brake / emergency. */
 static void Startup_Sequence(void)
 {
-    /* Works for an odd or an even strip length. With an odd count both
-       halves start on the same centre pixel; with an even count they start
-       on the two middle pixels. */
     const uint16_t right0 = LED_COUNT / 2u;
     const uint16_t left0  = (LED_COUNT - 1u) / 2u;
     const uint16_t steps  = LED_COUNT - right0;
@@ -235,36 +266,31 @@ static void Startup_Sequence(void)
         HAL_Delay(SWEEP_STEP_MS);
     }
 
-    HAL_Delay(250);                             /* hold full bright a moment */
-
-    for (uint16_t lvl = LEVEL_FULL; lvl > LEVEL_RUN; lvl -= 3u) {
-        WS2812_FillRGB((uint8_t)lvl, 0, 0);
-        WS2812_Show();
-        HAL_Delay(10);
-    }
-
-    WS2812_FillRGB(LEVEL_RUN, 0, 0);
+    HAL_Delay(100);       /* brief hold, then dark */
+    WS2812_Clear();       /* dark, ready for brake / emergency */
     WS2812_Show();
 }
 
-/* Paint one frame from the current input state.
-   The strip sits behind a red lens, so amber is not reproducible - green is
-   absorbed before it leaves the housing. Emergency therefore signals with
-   brightness instead of colour: the end sections blink full-red <-> off, so
-   they stay obvious whether the base is the 40% running level or full brake.
-   (Blinking against the base level would be invisible while braking.) */
+/* Paint one frame from the current input state:
+ *   Idle      - whole strip OFF.
+ *   Brake     - whole strip full red.
+ *   Emergency - the 14 LEDs at EACH end blink full-red <-> off; the centre
+ *               just shows the base (dark when idle, full red when braking).
+ * The strip sits behind a red lens, so only red/brightness is meaningful.
+ * 'emergency_lit' is the current phase of the firmware blink timer. */
 static void Render(bool brake, bool emergency, bool emergency_lit)
 {
-    uint8_t base = brake ? (uint8_t)LEVEL_FULL : (uint8_t)LEVEL_RUN;
+    uint8_t base = brake ? (uint8_t)LEVEL_FULL : 0u;   /* idle = OFF */
 
     WS2812_FillRGB(base, 0, 0);
 
     if (emergency) {
-        uint8_t edge = emergency_lit ? (uint8_t)LEVEL_FULL : 0u;
-        for (uint16_t i = 0; i < EDGE_COUNT; i++) {
-            WS2812_SetPixel(i, edge, 0, 0);
-            WS2812_SetPixel((uint16_t)(LED_COUNT - 1u - i), edge, 0, 0);
-        }
+        uint8_t er = emergency_lit ? (uint8_t)EMERG_R : 0u;   /* amber when lit */
+        uint8_t eg = emergency_lit ? (uint8_t)EMERG_G : 0u;
+        for (uint16_t i = 0; i < EDGE_COUNT_L; i++)           /* left end  (0 ..)         */
+            WS2812_SetPixel(i, er, eg, 0);
+        for (uint16_t i = 0; i < EDGE_COUNT_R; i++)           /* right end (.. LED_COUNT-1)*/
+            WS2812_SetPixel((uint16_t)(LED_COUNT - 1u - i), er, eg, 0);
     }
 
     WS2812_Show();
@@ -305,15 +331,19 @@ int main(void)
   MX_TIM11_Init();
   /* USER CODE BEGIN 2 */
   WS2812_Init();       /* TIM1_CH2N on PB14 + blank the strip */
-  Inputs_Init();       /* PB3 brake, PB5 emergency EXTI       */
 
-  /* The whole board is powered by the car's 12V, so power-up IS the "start"
-     event - the animation runs here, once, every time the car switches on.
-     Wait first: at cold power-up the LED strip's own 5V rail needs a moment
-     to come alive, and if we start clocking data out before then the strip
-     misses the sweep and you only ever see the steady running level. */
-  HAL_Delay(300);
-  Startup_Sequence();  /* red sweep middle -> ends, settle to running level */
+  /* The start button powers the board, so power-up IS the "start" event. Run
+     the start sweep NOW, in setup, BEFORE any interrupts are enabled - that
+     way nothing (e.g. a noisy input pin firing EXTIs) can disturb its timing.
+     Only after the sweep finishes do we enable the brake / emergency inputs
+     and drop into the main loop. */
+#if STARTUP_DIAG
+  Startup_Diag();      /* TEMP diagnostic: timing probe + position/length test */
+#else
+  Startup_Sequence();  /* centre -> ends sweep, then dark */
+#endif
+
+  Inputs_Init();       /* NOW enable PB3 brake / PB1 emergency interrupts */
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -331,13 +361,13 @@ int main(void)
     bool brake     = input_state[CH_BRAKE];      /* PB3 = brake light      */
     bool emergency = input_state[CH_EMERGENCY];  /* PB5 = emergency/hazard */
 
-    /* Emergency blinks the outer LEDs; the middle of the strip keeps showing
-       the running/brake level underneath. */
+    /* Emergency is a steady button, so the firmware blinks the end sections
+       itself: emergency_lit toggles every EMERG_HALF_MS (~1.4 Hz). */
     bool emergency_lit = ((HAL_GetTick() / EMERG_HALF_MS) % 2u) == 0u;
 
     /* Only push a new frame when the picture actually changes */
-    uint8_t frame = (uint8_t)((brake                    ? 1u : 0u)
-                            | (emergency                ? 2u : 0u)
+    uint8_t frame = (uint8_t)((brake                        ? 1u : 0u)
+                            | (emergency                    ? 2u : 0u)
                             | ((emergency && emergency_lit) ? 4u : 0u));
     static uint8_t last_frame = 0xFF;
     if (frame != last_frame) {
@@ -532,7 +562,7 @@ void EXTI3_IRQHandler(void)     /* PB3 = brake */
     HAL_GPIO_EXTI_IRQHandler(IN_BRAKE_PIN);
 }
 
-void EXTI9_5_IRQHandler(void)   /* PB5 = emergency (line 5 of the 5..9 group) */
+void EXTI1_IRQHandler(void)     /* PB1 = emergency */
 {
     HAL_GPIO_EXTI_IRQHandler(IN_EMERGENCY_PIN);
 }

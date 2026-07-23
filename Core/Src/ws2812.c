@@ -64,9 +64,14 @@ static void ws_hw_init(void)
     TIM1->CCMR1 &= ~(TIM_CCMR1_OC2M | TIM_CCMR1_CC2S);
     TIM1->CCMR1 |= (7u << TIM_CCMR1_OC2M_Pos) | TIM_CCMR1_OC2PE;
 
-    /* enable the complementary output, active high */
-    TIM1->CCER &= ~(TIM_CCER_CC2NP | TIM_CCER_CC2E);
-    TIM1->CCER |= TIM_CCER_CC2NE;
+    /* Enable the complementary output with INVERTED polarity (CC2NP=1): the
+       line idles HIGH and pulses LOW. Use this when there is an inverting
+       stage (e.g. a single-transistor level shifter) between PB14 and the
+       strip - without it, off-pixels arrive as all-1s and the strip lights
+       WHITE. If your board drives the strip directly (no inverter), remove
+       TIM_CCER_CC2NP here to go back to non-inverted output. */
+    TIM1->CCER &= ~TIM_CCER_CC2E;
+    TIM1->CCER |= TIM_CCER_CC2NE | TIM_CCER_CC2NP;
 
     TIM1->BDTR |= TIM_BDTR_MOE;             /* advanced timer main output   */
     TIM1->DIER |= TIM_DIER_CC2DE;           /* CC2 raises a DMA request     */
